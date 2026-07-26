@@ -70,6 +70,77 @@ source to the escrow address via `transferFrom`. The spigot never custodies fund
 and never approves anything. Everything else (append-only `register`, permissionless
 `route`, timelocked+clamped `shareBps`) is unchanged.
 
+## `RecoveryPool` is auxiliary, not a change to the core
+
+The LP extension adds two contracts and modifies none. `RecoveryEscrow`,
+`RecoveryClaim` and `RevenueSpigot` are byte-for-byte unchanged and have no
+knowledge of the pool — the integration is a transfer, which the balance-backed
+escrow already accepts from anyone. This was the constraint the extension was
+designed under, not a happy accident: a deployment either wants the socialised
+structure or it does not, and the escrow must be identical either way.
+
+The pool reuses the escrow's own idiom: repayment is `balanceOf`, not a ledger.
+Same benefit (any provenance counts, no `fund` entrypoint), same consequence
+(a transfer in is irreversible — up to the obligation, with the excess forwarded
+to the escrow rather than returned to the sender).
+
+### Draw-down burns proportionally, so notes need no checkpoints
+
+The design problem: an LP drawing a *partial* repayment must not forfeit their
+claim on the rest, but the obvious fix — per-holder dividend checkpoints settled
+in a transfer hook — costs storage on every transfer and complicates a token whose
+whole appeal is being a vanilla, tradeable ERC-20.
+
+Instead `redeem` pays the pro-rata slice of available cash and burns only the
+fraction of the notes that the cash repaid: `burn = ceil(assets * supply / owed)`.
+Since repayment reduces the obligation 1:1, `owed / supply` comes out exactly
+where it went in — the same price-neutrality `RecoveryEscrow.redeem` has, proved
+the same way. That makes the pool stateless per holder: no checkpoints, no
+transfer hook, no accrual bookkeeping per address, and the note stays a plain
+ERC-20 (invariants P4, P5).
+
+Rounding direction is deliberate and mirrors the escrow: `assets` floors and the
+burn *ceils*, so the redeemer pays the dust and the obligation per note can only
+ever move up for the holders who stay. Flooring the burn would leak value out of
+the remaining notes.
+
+A consequence worth stating: drawing down is first-come on *available cash*. An
+LP who leaves cash in the pool may find a co-LP has drawn their fair share of it
+first. Nobody's total entitlement changes — only how much of it is already
+liquid — but it means the pool is a claim on a stream, not a bank account.
+
+### Interest: touch-based accrual, hard cap
+
+Accrual is Compound-style — linear between touches, compounding once per touch —
+on the *outstanding* balance, so repaying early is genuinely cheaper. Two
+consequences to state plainly rather than hide:
+
+- `accrue()` is permissionless, so anyone (an LP, most obviously) can drive the
+  compounding frequency arbitrarily high. The effective rate should therefore be
+  priced as **continuously compounded**; that is its upper bound. An `expWad`
+  index would make it touch-independent and was considered, but it costs gas and
+  precision surface on every call to remove a wart the cap already bounds.
+- `MAX_REPAYMENT_BPS` caps cumulative interest at deployment and forever. This is
+  the same instinct as the spigot's immutable `[MIN, MAX]` share clamp: the
+  protocol's total liability must be knowable at the moment it is incurred. It
+  also stops an unpaid obligation compounding into a number nobody will ever
+  service, which — absent a spigot — would be symbolic anyway.
+
+`interestAccrued` is kept as storage even though the repo otherwise deleted its
+running totals as telemetry. It is not telemetry: it is what the cap is measured
+against. `principal` likewise anchors the cap.
+
+### The credible-commitment gap
+
+Deployed without a spigot, nothing on-chain compels repayment. The obligation the
+pool tracks is an accounting record of a promise, and LPs underwrite that. This is
+not a defect in the contract but it is a real property of the structure, and it
+decides who will deposit: insiders or a protocol treasury socialising internally,
+yes; external capital at a decent rate, unlikely. Pointing a `RevenueSpigot` at
+the pool address closes the gap without any code change — and because the pool
+becomes a pass-through once the notes are burned, a spigot left pointing at it
+keeps benefiting claimants forever after (P7).
+
 ## Standing decisions carried over
 
 - Claim `decimals == asset.decimals()`, so `ONE = 10**decimals` and all arithmetic
@@ -92,3 +163,12 @@ No merkle logic in this repo (distribution is external). No credited/uncredited
 split, no sweep, no fund/mint, no redemption floor, coupon/accrual, par state,
 lifecycle enum, pause, upgradeability, governance, multi-asset pool, or
 maturity/conversion.
+
+This describes the **claimant** side, and still does: `RecoveryClaim` has no
+accrual and the escrow has no par state. `RecoveryPool` deliberately does carry an
+accrual — that is the whole point of the LP structure, where the premium is a
+function of how long repayment takes rather than something embedded in the
+allocation at issuance. It is confined to the auxiliary contract and none of it
+reaches the escrow. Still absent on the LP side too: maturity, default/liquidation,
+conversion, transfer restrictions on the note, and any on-chain enforcement that
+repayment actually happens.

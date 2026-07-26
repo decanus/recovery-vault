@@ -35,7 +35,7 @@ jobs:
       # stays under the runner budget; bump the env vars (or FOUNDRY_PROFILE=ci)
       # for the exhaustive nightly run.
       - name: Invariant tests (sampled)
-        run: forge test --match-path "test/invariant/Invariants.t.sol"
+        run: forge test --match-path "test/invariant/*"
         env:
           FOUNDRY_INVARIANT_RUNS: "256"
           FOUNDRY_INVARIANT_DEPTH: "250"
