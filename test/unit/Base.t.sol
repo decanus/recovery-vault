@@ -7,8 +7,9 @@ import { RecoveryClaim } from "../../src/RecoveryClaim.sol";
 import { IERC20 } from "../../src/interfaces/IERC20.sol";
 import { MockERC20 } from "../mocks/MockERC20.sol";
 
-/// @dev Shared setup: a 6-decimal asset, an escrow, and its claim token, with a
-///      funded admin and a couple of helper actors.
+/// @dev Shared setup: a 6-decimal asset plus helpers to deploy an escrow (whose
+///      full supply is minted to `admin`, i.e. this test contract), hand claim
+///      tokens to holders, and fund the pot by transferring asset in.
 abstract contract BaseTest is Test {
     MockERC20 internal asset;
     RecoveryEscrow internal escrow;
@@ -23,25 +24,21 @@ abstract contract BaseTest is Test {
 
     function setUp() public virtual {
         asset = new MockERC20("USD Coin", "USDC", 6);
-        escrow = new RecoveryEscrow(IERC20(address(asset)), "Recovery Claim", "rcUSDC");
+    }
+
+    /// @dev Deploy an escrow with `supply` claim tokens minted to `admin` (this).
+    function _deploy(uint256 supply) internal {
+        escrow = new RecoveryEscrow(IERC20(address(asset)), supply, "Recovery Claim", "rcUSDC");
         claim = escrow.claim();
     }
 
-    /// @dev Mint `amount` asset to `who` and `fund` it into the pot as `who`.
-    function _fund(address who, uint256 amount) internal {
-        asset.mint(who, amount);
-        vm.startPrank(who);
-        asset.approve(address(escrow), amount);
-        escrow.fund(amount);
-        vm.stopPrank();
+    /// @dev Fund the pot: any asset landing at the escrow backs the claims.
+    function _fundPot(uint256 amount) internal {
+        asset.mint(address(escrow), amount);
     }
 
-    /// @dev Mint a claim allocation to a single holder (pre-finalisation).
-    function _distribute(address to, uint256 amount) internal {
-        address[] memory tos = new address[](1);
-        uint256[] memory amts = new uint256[](1);
-        tos[0] = to;
-        amts[0] = amount;
-        escrow.distribute(tos, amts);
+    /// @dev Hand `amount` claim tokens to `to` from the creator's balance.
+    function _give(address to, uint256 amount) internal {
+        claim.transfer(to, amount);
     }
 }

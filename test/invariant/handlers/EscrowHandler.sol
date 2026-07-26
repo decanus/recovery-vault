@@ -10,10 +10,12 @@ import { IERC20 } from "../../../src/interfaces/IERC20.sol";
 import { MockERC20 } from "../../mocks/MockERC20.sol";
 
 /// @title EscrowHandler
-/// @notice Drives the escrow through pre- and post-finalisation states and is
-///         able to drain the pot to `totalSupply == 0`. The handler *is* the
-///         escrow admin (it deploys the escrow in its constructor), so it can
-///         exercise the admin surface alongside the permissionless one.
+/// @notice Drives the escrow through pre- and post-finalisation states and can
+///         drain the pot to `totalSupply == 0`. The handler *is* the escrow admin
+///         (it deploys the escrow) and receives the full claim supply at
+///         construction, which it distributes to actors by transfer — mirroring
+///         the real flow (mint-all-to-creator, then distribute off-chain).
+///         The pot is `asset.balanceOf(escrow)`; funding is just a transfer in.
 /// @dev    Violations that must fail the suite are recorded as ghost flags rather
 ///         than asserted inline — under `fail_on_revert = false` an inline revert
 ///         from a failed assertion would be swallowed as "just another reverting
@@ -24,16 +26,13 @@ contract EscrowHandler is CommonBase, StdCheats, StdUtils {
     MockERC20 public immutable asset;
     uint256 internal immutable ONE;
 
-    address internal constant SWEEP_SINK = address(0x5147);
+    uint256 internal constant TOTAL_SUPPLY = 1_000_000_000;
 
     address[8] public actors;
 
-    // ── Ghost accounting (build spec §7.1) ──────────────────────────────────
-    uint256 public ghost_inflows;
-    uint256 public ghost_payouts;
-    uint256 public ghost_swept;
-    uint256 public ghost_donated;
-    uint256 public ghost_lastPrice;
+    // ── Ghost accounting ────────────────────────────────────────────────────
+    uint256 public ghost_inflows; // total asset ever sent into the escrow
+    uint256 public ghost_payouts; // total asset ever redeemed out
     uint256 public ghost_finalizedAt;
     uint256 public ghost_maxSupplyBurned;
 
@@ -44,7 +43,7 @@ contract EscrowHandler is CommonBase, StdCheats, StdUtils {
     bool public ghost_bigHolderRedeemedInFull;
 
     // ── Violation flags (asserted by Invariants) ────────────────────────────
-    bool public flag_i5_donationMovedPrice;
+    bool public flag_i5_fundingLoweredPrice;
     bool public flag_i6_redeemBeforeFinalize;
     bool public flag_i8_overPayout;
     bool public flag_i8_notDrained;
@@ -56,8 +55,8 @@ contract EscrowHandler is CommonBase, StdCheats, StdUtils {
 
     constructor() {
         asset = new MockERC20("USD Coin", "USDC", 6);
-        // Deploying here makes this handler the admin.
-        escrow = new RecoveryEscrow(IERC20(address(asset)), "Recovery Claim", "rcUSDC");
+        escrow =
+            new RecoveryEscrow(IERC20(address(asset)), TOTAL_SUPPLY, "Recovery Claim", "rcUSDC");
         claim = escrow.claim();
         ONE = escrow.ONE();
 
@@ -65,27 +64,26 @@ contract EscrowHandler is CommonBase, StdCheats, StdUtils {
             actors[i] = address(uint160(0x1000 + i));
         }
 
-        // Seed a materially-varied base distribution while still open:
+        // Distribute the full supply to actors by transfer (materially varied):
         // actor0 holds > 40%; actor7 holds exactly 1 wei.
-        address[] memory to = new address[](8);
-        uint256[] memory amt = new uint256[](8);
-        to[0] = actors[0];
-        amt[0] = 450_000_000; // 45%
-        to[1] = actors[1];
-        amt[1] = 200_000_000;
-        to[2] = actors[2];
-        amt[2] = 150_000_000;
-        to[3] = actors[3];
-        amt[3] = 100_000_000;
-        to[4] = actors[4];
-        amt[4] = 60_000_000;
-        to[5] = actors[5];
-        amt[5] = 30_000_000;
-        to[6] = actors[6];
-        amt[6] = 9_999_999;
-        to[7] = actors[7];
-        amt[7] = 1; // dust holder
-        escrow.distribute(to, amt);
+        uint256[8] memory amt = [
+            uint256(450_000_000),
+            200_000_000,
+            150_000_000,
+            100_000_000,
+            60_000_000,
+            30_000_000,
+            9_999_999,
+            1
+        ];
+        uint256 sum;
+        for (uint256 i; i < 8; ++i) {
+            claim.transfer(actors[i], amt[i]);
+            sum += amt[i];
+        }
+        // The allocation must consume the whole supply, or the handler would keep
+        // a residual it could redeem — silently changing what the campaign covers.
+        require(sum == TOTAL_SUPPLY, "allocation != TOTAL_SUPPLY");
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
@@ -114,94 +112,28 @@ contract EscrowHandler is CommonBase, StdCheats, StdUtils {
 
     // ── actions ─────────────────────────────────────────────────────────────
 
-    function distributeBatch(uint256 seed, uint256 a1, uint256 a2) external {
-        totalActions++;
-        if (escrow.finalized()) return; // distribute reverts post-finalize; skip
-        address[] memory to = new address[](2);
-        uint256[] memory amt = new uint256[](2);
-        to[0] = _actor(seed);
-        to[1] = _actor(seed >> 8);
-        amt[0] = bound(a1, 0, 1_000_000);
-        amt[1] = bound(a2, 0, 1_000_000);
-        try escrow.distribute(to, amt) { }
-        catch {
-            totalReverts++;
-        }
-    }
-
-    function correctAllocation(uint256 seed, uint256 amt) external {
-        totalActions++;
-        if (escrow.finalized()) return;
-        address from = _actor(seed);
-        address to = _actor(seed >> 8);
-        uint256 bal = claim.balanceOf(from);
-        if (bal == 0) return;
-        uint256 m = bound(amt, 0, bal);
-        try escrow.correct(from, to, m) { }
-        catch {
-            totalReverts++;
-        }
-    }
-
     function finalizeSupply() external {
         totalActions++;
         if (escrow.finalized()) return;
         try escrow.finalize() {
             ghost_finalizedAt = block.number == 0 ? 1 : block.number;
             ghost_supplyAtFinalize = claim.totalSupply();
-            ghost_lastPrice = _price();
         } catch {
             totalReverts++;
         }
     }
 
-    function fund(uint256 amt) external {
-        totalActions++;
-        uint256 m = bound(amt, 0, 1_000_000_000);
-        if (m == 0) return;
-        asset.mint(address(this), m);
-        asset.approve(address(escrow), m);
-        try escrow.fund(m) {
-            ghost_inflows += m;
-        } catch {
-            totalReverts++;
-        }
-    }
-
-    /// @dev Direct transfer, bypassing fund(): must not move the price (I5).
-    function donate(uint256 amt) external {
+    /// @dev Fund the pot by transferring asset straight into the escrow. This is
+    ///      the only funding path now, and it raises the price — a gift to all
+    ///      holders. I5: it must never *lower* the price.
+    function fundPot(uint256 amt) external {
         totalActions++;
         uint256 m = bound(amt, 1, 1_000_000_000);
         asset.mint(address(this), m);
         uint256 pBefore = _price();
         asset.transfer(address(escrow), m);
-        ghost_donated += m;
-        if (_price() != pBefore) flag_i5_donationMovedPrice = true;
-    }
-
-    function creditUncredited(uint256 amt) external {
-        totalActions++;
-        uint256 u = escrow.uncredited();
-        if (u == 0) return;
-        uint256 m = bound(amt, 1, u);
-        try escrow.creditUncredited(m) {
-            ghost_inflows += m;
-        } catch {
-            totalReverts++;
-        }
-    }
-
-    function sweepUncredited(uint256 amt) external {
-        totalActions++;
-        uint256 u = escrow.uncredited();
-        if (u == 0) return;
-        uint256 m = bound(amt, 1, u);
-        try escrow.sweepUncredited(SWEEP_SINK, m) {
-            ghost_swept += m;
-            ghost_inflows += m; // sweep counts as inflow for conservation (I3)
-        } catch {
-            totalReverts++;
-        }
+        ghost_inflows += m;
+        if (_price() < pBefore) flag_i5_fundingLoweredPrice = true;
     }
 
     function transferClaim(uint256 seed, uint256 amt) external {
@@ -251,11 +183,12 @@ contract EscrowHandler is CommonBase, StdCheats, StdUtils {
         }
 
         uint256 supplyBefore = claim.totalSupply();
-        uint256 poolBefore = escrow.poolBalance();
+        uint256 balBefore = asset.balanceOf(address(escrow));
 
-        // Snapshot every non-redeeming actor's claimable at the pre-call price
-        // (the price is the same for all actors at this instant) — I9.
-        uint256 priceBefore = escrow.pricePerClaim();
+        // Snapshot every non-redeeming actor's claimable at the pre-call price.
+        // priceBefore == pricePerClaim() here, derived from locals we already hold
+        // (supplyBefore > 0, since supply == 0 was handled above).
+        uint256 priceBefore = balBefore * ONE / supplyBefore;
         uint256[8] memory claimableBefore;
         for (uint256 i; i < 8; ++i) {
             if (actors[i] != who) claimableBefore[i] = _claimableAt(actors[i], priceBefore);
@@ -264,10 +197,10 @@ contract EscrowHandler is CommonBase, StdCheats, StdUtils {
         vm.prank(who);
         try escrow.redeem(amt, who) returns (uint256 assets) {
             // I8: no redeemer extracts more than exact pro-rata share.
-            if (assets * supplyBefore > amt * poolBefore) flag_i8_overPayout = true;
+            if (assets * supplyBefore > amt * balBefore) flag_i8_overPayout = true;
 
             // I8 paired: the redemption that empties supply drains the pot.
-            if (claim.totalSupply() == 0 && escrow.poolBalance() != 0) {
+            if (claim.totalSupply() == 0 && asset.balanceOf(address(escrow)) != 0) {
                 flag_i8_notDrained = true;
             }
 

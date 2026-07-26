@@ -1,12 +1,14 @@
 # Recovery Claim
 
 A pot of a single ERC-20 asset, and a transferable token that is a pro-rata claim
-on it. Loss-bearing addresses are minted a plain ERC-20 (`RecoveryClaim`). Supply
-is finalised once, one-way. From then on the only holder action is:
+on it. The **entire** claim supply is minted once, at construction, to the
+creator, who distributes it off-chain — e.g. by funding a merkle-drop distributor
+that `transfer`s tokens to loss-bearing addresses. Supply is finalised (redemption
+opened) one-way. From then on the only holder action is:
 
 ```
 redeem(amount) → burn `amount` of the claim token,
-                 receive `amount × poolBalance ÷ totalSupply` of the asset
+                 receive `amount × balance ÷ totalSupply` of the asset
 ```
 
 Anyone holding the token can redeem. No proofs, no allowlist, no eligibility
@@ -17,115 +19,100 @@ care how you got it.
 
 | Contract | Role |
 |---|---|
-| `RecoveryClaim` | Vanilla, fully transferable ERC-20. Only the escrow may mint/burn. Minting latches shut at finalisation. |
-| `RecoveryEscrow` | Holds the pot, owns the only mint/burn rights, and prices/settles redemptions. |
-| `RevenueSpigot` | Independent. Intercepts a fixed, timelocked share of protocol revenue and funds the escrow. |
+| `RecoveryClaim` | Vanilla, fully transferable ERC-20. Full supply minted to the creator at construction; only `burn` (escrow-only, on redemption) ever changes supply after that. No `mint`. |
+| `RecoveryEscrow` | Holds the pot and prices/settles redemptions. |
+| `RevenueSpigot` | Independent. Intercepts a fixed, timelocked share of protocol revenue and forwards it to the escrow by transfer. |
 
-The escrow deploys the claim token in its own constructor, so the binding is 1:1,
-immutable on both sides, and correct atomically — no post-deploy setter, no
-`initialize`, no CREATE2 precompute, no front-runnable window.
+The escrow deploys the claim token in its own constructor and mints the whole
+supply to the creator (`msg.sender`) atomically. The binding is 1:1, immutable on
+both sides — no post-deploy setter, no `initialize`, no CREATE2 precompute.
 
-## The load-bearing rule
+## The pot is the balance
 
-`poolBalance` is an **internal ledger**. It is never `asset.balanceOf(escrow)`.
-
-```solidity
-uint256 public poolBalance;                                   // credited, redeemable
-function uncredited() public view returns (uint256) {
-    return asset.balanceOf(address(this)) - poolBalance;      // present, NOT redeemable
-}
-```
-
-Assets arrive at this address by direct transfer — clawed-back funds, unfrozen
-exchange balances, law-enforcement returns — often with no warning, and some of it
-is subject to ongoing legal process or owed elsewhere. **Arrival is not a
-crediting decision.** Funds that land here are *uncredited* and pay out to nobody
-until an admin calls `creditUncredited`. `poolBalance` rises only in `fund` and
-`creditUncredited`, and falls only in `redeem`. Nothing else ever touches it.
-
-A direct transfer therefore does not move `pricePerClaim()`; it only grows
-`uncredited()`. (Invariant I5 is the cheapest test that proves the price reads the
-ledger, not `balanceOf`.)
-
-## Pricing
+`pricePerClaim` and `redeem` read `asset.balanceOf(address(this))` directly. **Any
+asset that lands at the escrow — however it arrives — backs the claims and is
+redeemable.** There is no credited/uncredited distinction, no `fund` entrypoint,
+and no sweep.
 
 ```solidity
 function pricePerClaim() public view returns (uint256) {
     uint256 supply = claim.totalSupply();
     if (supply == 0) return 0;
-    return poolBalance * ONE / supply;   // ONE = 10 ** asset.decimals()
+    return asset.balanceOf(address(this)) * ONE / supply;   // ONE = 10**decimals
 }
 ```
 
-Both terms are live: `poolBalance` (already reduced by every prior payout) over
-`claim.totalSupply()` (already reduced by every prior burn). Redemption is
-**price-neutral** — a redeemer takes exactly their pro-rata share and burns
-exactly their pro-rata claim, so the ratio is unchanged for everyone left. Only
-inflows (`fund`, `creditUncredited`) move the price up. Floor division means dust
-can concentrate on remaining holders, which nudges the price *up*, never down.
+This is safe because supply is fixed at construction (nobody deposits for shares,
+so there is no ERC-4626-style inflation attack) and a transfer in only ever
+**raises** the price pro-rata for every holder — a gift, not an attack.
 
-`totalInflows`, `totalPayouts`, `totalSwept` are accounting history for the
-conservation invariant and public progress reporting only. They never appear in
-`pricePerClaim` or `redeem`.
+**Consequence — read before deploying:** funding is just a transfer to the escrow
+address, and it is irreversible. Anything sent there, including a mistaken or
+accidental transfer, becomes claimant money with no way to recover it. Do not send
+funds that are earmarked elsewhere or still subject to legal process; hold those
+outside the escrow until they are unambiguously claimant property.
+
+Redemption is **price-neutral**: a redeemer takes exactly their pro-rata share and
+burns exactly their pro-rata claim, so the ratio is unchanged for everyone left.
+Floor division means dust can only ever nudge the price up.
 
 ## Deployment & distribution ordering
 
-1. **Deploy** `RecoveryEscrow(asset, name, symbol)` from the admin key. Requires
-   `asset.decimals() <= 18`. The claim token is deployed automatically.
-   - `script/Deploy.s.sol` (env: `ASSET`, `CLAIM_NAME`, `CLAIM_SYMBOL`).
-2. **Distribute** the loss list, in batches, while unfinalised. Callable
-   repeatedly; duplicate addresses accumulate. `correct(from, to, amount)` fixes
-   errors found after a batch lands, without changing total supply.
-   - `script/Distribute.s.sol` reads a CSV of `address,amount` (raw units, no
-     header) and drives batched `distribute` calls (env: `ESCROW`, `CSV`,
-     `BATCH_SIZE`).
-3. **Fund** the pot via `fund(amount)` (permissionless, pulls the asset) and/or by
-   crediting arrivals with `creditUncredited(amount)`.
-4. **`finalize()`** — one-way, irreversible. After it: no mint, no admin burn,
-   supply is monotonically non-increasing, and `redeem` becomes available.
-   `redeem` reverts while unfinalised.
+Because 100% of the supply is minted to the creator, the creator transiently holds
+every claim. Redemption is gated on `finalize()` precisely so a creator holding the
+full supply cannot drain the pot before distributing. Order matters:
 
-Funding and distribution may interleave before finalisation. Redemption is only
-enabled after finalisation, when `totalSupply` equals the true liability.
+1. **Deploy** `RecoveryEscrow(asset, supply, name, symbol)` from the creator/admin
+   key. Requires `asset.decimals() <= 18`. The claim token is deployed and the
+   full `supply` minted to the creator automatically.
+   - `script/Deploy.s.sol` (env: `ASSET`, `SUPPLY`, `CLAIM_NAME`, `CLAIM_SYMBOL`).
+2. **Distribute** the claim tokens off-chain: build the loss-list merkle tree, fund
+   an external distributor (e.g. [1inch/merkle-distribution](https://github.com/1inch/merkle-distribution))
+   with the tokens, publish the root. Claimants `claim` their tokens (a transfer,
+   not a mint) whenever they like.
+3. **Fund** the pot by transferring the asset to the escrow address (or via the
+   `RevenueSpigot`). Do this **after** distributing the claim tokens.
+4. **`finalize()`** — one-way, irreversible. Opens redemption. `redeem` reverts
+   until it is called.
+
+The trust model: the creator is trusted with the full supply until it is
+distributed, and the ordering above is a process discipline, not something the
+contract can enforce beyond the `finalize` gate. For a recovery vehicle run by an
+accountable administrator with a publicly verifiable merkle root, this is the
+intended tradeoff for deleting all on-chain distribution machinery.
 
 ## Constructor parameters
 
-### `RecoveryEscrow(IERC20 asset, string name, string symbol)`
-- `asset` — the single pot asset. **Must** have `decimals() <= 18` (enforced),
-  **must not** be fee-on-transfer (rejected at `fund` time by a pre/post balance
-  check), and **must not** be rebasing (see below).
-- `name`, `symbol` — metadata for the deployed claim token. Its `decimals` is set
-  to `asset.decimals()`, so one whole claim token maps to one whole asset unit and
-  all arithmetic is raw-unit.
+### `RecoveryEscrow(IERC20 asset, uint256 supply, string name, string symbol)`
+- `asset` — the single pot asset. **Must** have `decimals() <= 18` (enforced) and
+  **must not** be rebasing (a rebasing balance would silently reprice the pot;
+  undetectable on-chain — a deployment requirement). Fee-on-transfer assets are
+  harmless: the pot is read live, so whatever actually arrives is what backs the
+  claims.
+- `supply` — the total, fixed claim supply (the full liability), minted in its
+  entirety to the deployer.
+- `name`, `symbol` — claim token metadata. Its `decimals` is set to
+  `asset.decimals()`, so one whole claim token maps to one whole asset unit.
 
 ### `RevenueSpigot(IERC20 asset, IRecoveryEscrow escrow, uint256 minShareBps, uint256 maxShareBps, uint256 initialShareBps)`
 - `asset` — the revenue asset (must match the escrow's asset).
-- `escrow` — the escrow that receives the intercepted share.
+- `escrow` — receives the intercepted share (by direct transfer).
 - `minShareBps` / `maxShareBps` — the fixed, forever-immutable clamp on the
-  intercept share. `0 < min <= max <= 10000`. The admin can never drive the share
-  outside this range, even after the timelock, so the intercept can never be
-  zeroed.
+  intercept share (`0 < min <= max <= 10000`). The admin can never drive the share
+  outside this range, so the intercept can never be zeroed.
 - `initialShareBps` — starting share, within `[min, max]`.
   `register(source)` (append-only), `route(source)` (permissionless), and the
   `queueShareChange → SHARE_TIMELOCK (2 days) → executeShareChange` flow manage it.
 
 ## Off-chain requirements
 
-- **Snapshot derivation.** The loss list is settled entirely off-chain: publish a
-  snapshot of loss-bearing addresses and amounts, derived from the incident's
-  ledger. The chain records only the resulting allocations.
-- **Dispute process.** Run a dispute window against the published snapshot before
-  writing allocations. Apply resolutions via `correct` (post-batch) up until
-  `finalize`.
-- **Premium multiplier (coupon).** Compensation for time-to-repayment is handled
-  *at issuance*, not in code: mint a premium (e.g. 1.05 claim tokens per dollar
-  lost) and set the funding target accordingly. There is no on-chain time-based
-  accrual, face-value cap, or par state by design.
-- **Non-rebasing asset (hard requirement).** A rebasing asset silently changes
-  `asset.balanceOf(escrow)` out from under the ledger, breaking the
-  credited/uncredited separation. This cannot be detected on-chain; **do not
-  deploy against a rebasing asset.** Fee-on-transfer assets are rejected
-  automatically by `fund`.
+- **Snapshot & dispute.** The loss list is settled entirely off-chain — publish a
+  snapshot, run a dispute window, finalise the allocation, then build the merkle
+  tree used to distribute the claim tokens.
+- **Premium multiplier (coupon).** Compensation for time-to-repayment is handled at
+  issuance: choose the total `supply` and per-address allocations to embed any
+  premium. There is no on-chain accrual, face-value cap, or par state.
+- **Non-rebasing asset (hard requirement).** Do not deploy against a rebasing asset.
 
 ## Build & test
 
@@ -135,24 +122,11 @@ forge test                 # default profile (fuzz 10k)
 FOUNDRY_PROFILE=ci forge test   # ci profile (fuzz 50k, invariant 5k×500)
 forge coverage --report summary
 forge fmt --check
-forge test --match-contract GasBenchTest -vv   # distribute gas at 50/100/250
 ```
-
-### `distribute` gas (size the batches against the chain's block gas limit)
-
-| Batch size | Gas | ~per allocation |
-|---|---|---|
-| 50 | ~1.39M | ~27.9k |
-| 100 | ~2.75M | ~27.5k |
-| 250 | ~6.83M | ~27.3k |
-
-Roughly linear at ~27.5k gas per allocation (first mint to a fresh address).
-On a 30M-gas block, a batch of ~1000 fits with margin; pick a batch size well
-under the target chain's limit.
 
 ### Note on invariant run times
 
-The 9 invariants are checked after every handler call, so the spec's default
+The invariants are checked after every handler call, so the spec's default
 (`runs=1000, depth=200`) and CI (`runs=5000, depth=500`) profiles are CI-grade
 long-running jobs. For a quick local check, sample with e.g.
 `FOUNDRY_INVARIANT_RUNS=150 FOUNDRY_INVARIANT_DEPTH=250 forge test --match-path

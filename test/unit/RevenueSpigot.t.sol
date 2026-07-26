@@ -1,33 +1,25 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import { Test } from "forge-std/Test.sol";
-import { RecoveryEscrow } from "../../src/RecoveryEscrow.sol";
+import { BaseTest } from "./Base.t.sol";
 import { RevenueSpigot } from "../../src/RevenueSpigot.sol";
 import { IERC20 } from "../../src/interfaces/IERC20.sol";
-import { IRecoveryEscrow } from "../../src/interfaces/IRecoveryEscrow.sol";
-import { MockERC20 } from "../mocks/MockERC20.sol";
 import { MockRevenueSource } from "../mocks/MockRevenueSource.sol";
 
-contract RevenueSpigotTest is Test {
-    MockERC20 internal asset;
-    RecoveryEscrow internal escrow;
+contract RevenueSpigotTest is BaseTest {
     RevenueSpigot internal spigot;
     MockRevenueSource internal source;
 
-    address internal admin = address(this);
     address internal stranger = address(0xBEEF);
 
     uint256 internal constant MIN = 500; // 5%
     uint256 internal constant MAX = 5000; // 50%
     uint256 internal constant INIT = 1000; // 10%
 
-    function setUp() public {
-        asset = new MockERC20("USD Coin", "USDC", 6);
-        escrow = new RecoveryEscrow(IERC20(address(asset)), "Recovery Claim", "rcUSDC");
-        spigot = new RevenueSpigot(
-            IERC20(address(asset)), IRecoveryEscrow(address(escrow)), MIN, MAX, INIT
-        );
+    function setUp() public override {
+        super.setUp(); // deploys `asset`
+        _deploy(1_000_000); // deploys `escrow` + `claim`
+        spigot = new RevenueSpigot(IERC20(address(asset)), address(escrow), MIN, MAX, INIT);
         source = new MockRevenueSource(IERC20(address(asset)));
     }
 
@@ -35,14 +27,12 @@ contract RevenueSpigotTest is Test {
 
     function test_construction_badBoundsRevert() public {
         vm.expectRevert(RevenueSpigot.InvalidBounds.selector);
-        new RevenueSpigot(
-            IERC20(address(asset)), IRecoveryEscrow(address(escrow)), 6000, 5000, 5500
-        );
+        new RevenueSpigot(IERC20(address(asset)), address(escrow), 6000, 5000, 5500);
     }
 
     function test_construction_initOutOfRangeReverts() public {
         vm.expectRevert(RevenueSpigot.ShareOutOfRange.selector);
-        new RevenueSpigot(IERC20(address(asset)), IRecoveryEscrow(address(escrow)), MIN, MAX, 100);
+        new RevenueSpigot(IERC20(address(asset)), address(escrow), MIN, MAX, 100);
     }
 
     // ── Registration ─────────────────────────────────────────────────────────
@@ -80,9 +70,10 @@ contract RevenueSpigotTest is Test {
         uint256 routed = spigot.route(address(source));
         // 10% of 1,000,000
         assertEq(routed, 100_000);
-        assertEq(escrow.poolBalance(), 100_000, "escrow not funded");
+        assertEq(asset.balanceOf(address(escrow)), 100_000, "escrow not funded");
         assertEq(asset.balanceOf(address(source)), 900_000, "remainder not left at source");
-        assertEq(escrow.totalInflows(), 100_000);
+        // routed straight to the escrow; the spigot holds nothing
+        assertEq(asset.balanceOf(address(spigot)), 0, "spigot should not custody funds");
     }
 
     function test_route_permissionless() public {
@@ -91,7 +82,7 @@ contract RevenueSpigotTest is Test {
         source.approveSpigot(address(spigot), type(uint256).max);
         vm.prank(stranger);
         spigot.route(address(source));
-        assertEq(escrow.poolBalance(), 100_000);
+        assertEq(asset.balanceOf(address(escrow)), 100_000);
     }
 
     function test_route_zeroShareReverts() public {

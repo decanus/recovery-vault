@@ -3,12 +3,12 @@ pragma solidity 0.8.26;
 
 import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
 import { IERC20 } from "./interfaces/IERC20.sol";
-import { IRecoveryEscrow } from "./interfaces/IRecoveryEscrow.sol";
 
 /// @title RevenueSpigot
 /// @notice Intercepts a fixed share of protocol revenue from registered sources
-///         and forwards it into a `RecoveryEscrow` via `fund`. Independent of the
-///         escrow/claim pair; deployable separately.
+///         and forwards it to the escrow by transfer — any asset held by the
+///         escrow backs the claims. Independent of the escrow/claim pair;
+///         deployable separately.
 /// @dev    Source registration is append-only (sources can never be removed).
 ///         `route` is permissionless. `shareBps` changes are timelocked and
 ///         clamped to a fixed `[MIN_SHARE_BPS, MAX_SHARE_BPS]` range so the admin
@@ -22,7 +22,7 @@ contract RevenueSpigot {
     uint256 public constant SHARE_TIMELOCK = 2 days;
 
     IERC20 public immutable asset;
-    IRecoveryEscrow public immutable escrow;
+    address public immutable escrow;
     address public immutable admin;
 
     /// @notice Fixed bounds on `shareBps`, set at deployment and never changeable.
@@ -60,13 +60,13 @@ contract RevenueSpigot {
     }
 
     /// @param _asset The revenue asset (must match the escrow's asset).
-    /// @param _escrow The escrow that receives the intercepted share.
+    /// @param _escrow The escrow address that receives the intercepted share.
     /// @param minShareBps Lower clamp on `shareBps`, fixed forever.
     /// @param maxShareBps Upper clamp on `shareBps`, fixed forever.
     /// @param initialShareBps Starting share; must lie within the clamp range.
     constructor(
         IERC20 _asset,
-        IRecoveryEscrow _escrow,
+        address _escrow,
         uint256 minShareBps,
         uint256 maxShareBps,
         uint256 initialShareBps
@@ -93,9 +93,9 @@ contract RevenueSpigot {
         emit SourceRegistered(source);
     }
 
-    /// @notice Pull the intercepted share of a registered source's approved
-    ///         balance and fund the escrow with it. Permissionless. The
-    ///         non-intercepted remainder is left with the source.
+    /// @notice Transfer the intercepted share of a registered source's approved
+    ///         balance to the escrow. Permissionless. The non-intercepted
+    ///         remainder is left with the source.
     /// @dev    The source must have approved this spigot to pull. The amount
     ///         considered is `min(source balance, source allowance to spigot)`.
     function route(address source) external returns (uint256 toEscrow) {
@@ -105,9 +105,9 @@ contract RevenueSpigot {
         uint256 amount = bal < allowed ? bal : allowed;
         toEscrow = amount * shareBps / BPS;
         if (toEscrow == 0) revert NothingToRoute();
-        address(asset).safeTransferFrom(source, address(this), toEscrow);
-        address(asset).safeApprove(address(escrow), toEscrow);
-        escrow.fund(toEscrow);
+        // Transfer straight to the escrow — any asset held by the escrow backs
+        // the claims, so no intermediate hop or `fund` call is needed.
+        address(asset).safeTransferFrom(source, escrow, toEscrow);
         emit Routed(source, toEscrow);
     }
 

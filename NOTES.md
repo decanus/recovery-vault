@@ -1,121 +1,94 @@
-# NOTES — judgement calls & deviations
+# NOTES — design decisions
 
-Every place the build spec left a decision, and every place I wanted to deviate.
+This system was originally specced with on-chain batched distribution and a
+credited/uncredited ledger. It was then deliberately simplified. This file records
+the decisions that shaped the current design.
 
-## Accounting model for `sweepUncredited` (I3 conservation)
+## Distribution moved off-chain (merkle drop)
 
-The spec fixes I3 as `totalInflows == totalPayouts + totalSwept + poolBalance` but
-does not state which state transitions touch which counter. The only assignment
-that makes I3 a true invariant:
+The full claim supply is minted once, at construction, to the creator. All on-chain
+distribution machinery (`distribute`, `correct`, batched minting, `mint`,
+`closeMinting`, the `mintingClosed` latch) was removed. The creator distributes the
+tokens off-chain — the intended path is a merkle-drop distributor
+([1inch/merkle-distribution](https://github.com/1inch/merkle-distribution)) whose
+`claim` **transfers** pre-funded tokens rather than minting them, which is exactly
+what a fixed-supply token needs.
 
-| Function | `poolBalance` | `totalInflows` | `totalPayouts` | `totalSwept` |
-|---|---|---|---|---|
-| `fund` | `+= amount` | `+= amount` | — | — |
-| `creditUncredited` | `+= amount` | `+= amount` | — | — |
-| `sweepUncredited` | — | `+= amount` | — | `+= amount` |
-| `redeem` | `-= assets` | — | `+= assets` | — |
+Why this is safe: minting the whole supply up front means `claim.totalSupply()`
+equals the full liability from birth, so redemption pricing is correct immediately
+— no "supply smaller than liability, redeemer drains the pot" window. A lazy-minting
+merkle drop would *not* be safe, because supply would grow as stragglers claim.
 
-`sweepUncredited` **increments `totalInflows` as well as `totalSwept`**. Proof:
-`RHS = payouts + swept + pool = redeems + sweeps + (funds + credits − redeems) =
-funds + credits + sweeps = totalInflows`. If sweep touched only `totalSwept`, I3
-would break the moment anything is swept. Semantically: `totalInflows` is "value
-that entered the accounting system," whether it went to the pool or was recognised
-and swept back out. A swept donation is counted at the moment of the sweep
-decision, not at silent arrival. Documented in `RecoveryEscrow.sweepUncredited`.
+**Trust tradeoff (accepted):** direct on-chain distribution could misallocate but
+never steal, because the admin never held redeemable claims. Minting 100% to the
+creator inverts that — the creator transiently holds the entire supply. The
+`finalize()` gate (redemption reverts until flipped) plus the discipline of
+distributing before funding are the mitigations; the merkle root is publicly
+auditable. This is appropriate for a recovery vehicle run by an accountable
+administrator.
 
-## `fund` signature — dropped the `source` argument
+## The pot is `balanceOf`, not a ledger
 
-§6 shows `escrow.fund(amount, REVENUE)`, but §4's "complete external surface" is
-authoritative and lists `fund(uint256 amount)`, and §3 states attribution is
-`msg.sender` on the `Funded` event, resolved off-chain. I implemented
-`fund(uint256)` with a `Funded(from, amount)` event and made the spigot call
-`escrow.fund(amount)`. The `REVENUE` enum from the design-space doc is not carried
-into v1 — there is no on-chain provenance tag.
+The credited/uncredited ledger (`poolBalance`, `fund`, `creditUncredited`,
+`sweepUncredited`, `uncredited`) was removed. `pricePerClaim`/`redeem` now read
+`asset.balanceOf(address(this))` directly: **any asset at the escrow backs the
+claims and is redeemable, regardless of provenance.**
 
-## `redeem` uses `claim.totalSupply()`, not a bare `totalSupply()`
+This is a real product decision with a real consequence: a transfer in is
+irreversible claimant money — there is no sweep to recover a mistaken or earmarked
+transfer. It is safe against the classic attacks because supply is fixed (no
+share-minting deposit, so no ERC-4626 inflation attack) and a donation only ever
+raises the price pro-rata (a gift). Operationally, earmarked/uncleared funds must
+simply be kept outside the escrow until they are unambiguously claimant property.
 
-§4.2's snippet writes `uint256 supply = totalSupply();`. The escrow has no
-`totalSupply` of its own; the only correct reading is `claim.totalSupply()`
-(matching §4.1 and the price table). Implemented as `claim.totalSupply()`.
+Because of this, invariant **I5 is inverted**: it was "a direct transfer does not
+move the price"; it is now "funding never *lowers* the price." Solvency (I2) becomes
+automatic — total claimable always equals the balance (minus floor dust).
 
-## `redeem` when `supply == 0`
+## Removed on-chain running totals
 
-`amount == 0` is a permitted no-op *except* when `supply == 0`, where
-`amount * poolBalance / supply` is `0/0` and reverts (EVM panic). This is only
-reachable after every token has been burned, i.e. a terminal state where no one
-holds anything to redeem. I left the spec's exact body (no guard) rather than add
-a state variable / branch not in §4. The revert is harmless: it is a no-op call in
-a dead state. The invariant handler guards this case so it does not pollute the
-revert-rate metric.
+`totalInflows`, `totalPayouts`, `totalSwept` were removed. They were pure telemetry
+— never read by any logic. Every amount is already carried on an event
+(`Redeemed`, and asset `Transfer` for inflows), so an indexer reconstructs any total
+for free. Their only on-chain use was the conservation invariant I3, which is now
+tracked via the invariant handler's ghost variables instead. This saves an SSTORE on
+every redemption. `poolBalance -= assets` is *not* in this category — it was the
+ledger and is gone with the ledger; the balance now decreases naturally on the
+payout `transfer`.
 
-## I1 monotonicity excludes the `supply == 0` terminal state
+## `finalize()` kept as the redemption gate
 
-`pricePerClaim()` returns `0` when `supply == 0` (spec §4.1). The redemption that
-drains the last tokens therefore takes the price from a positive value to `0`,
-which is literally a *decrease*. I read I1 as "price non-decreasing **while there
-are claims outstanding**": `invariant_I1` skips when `supply == 0`. Supply can
-never recover post-finalisation, so this excludes exactly one terminal transition
-and nothing else. Without this guard, I1 would false-positive on the very
-last-holder-drains case the spec's own §8 rounding test exercises.
+Its original job (close minting) is obsolete — supply is fixed at construction. Its
+remaining job matters more: since the creator holds the whole supply at birth,
+without a gate they could redeem the entire pot on day one. `finalize()` is one-way,
+admin-only, and `redeem` reverts until it is called (invariant I6).
 
-## I7 is a standalone enumerated test, not a per-call invariant
+## `RevenueSpigot` funds by transfer
 
-I7 ("no selector reduces the price") reads naturally as an *enumeration* of the
-escrow's external surface, which a fuzz invariant does not express (and pre-
-finalisation `distribute` legitimately lowers the price by growing supply, so a
-blanket per-call assertion would be false). Implemented as
-`test_I7_noSelectorReducesPrice`, which post-finalisation invokes every mutating
-selector — `distribute`/`correct`/`finalize` (revert, price unchanged), `fund`,
-`creditUncredited`, `sweepUncredited`, `redeem`, plus `claim.transfer` — and
-asserts the price is non-decreasing for each. `invariant_I7_placeholder` keeps the
-numbering contiguous in the invariant contract and points at the real test.
+With no `fund` entrypoint, `route` transfers the intercepted share straight from the
+source to the escrow address via `transferFrom`. The spigot never custodies funds
+and never approves anything. Everything else (append-only `register`, permissionless
+`route`, timelocked+clamped `shareBps`) is unchanged.
 
-## Violation-flag pattern under `fail_on_revert = false`
+## Standing decisions carried over
 
-With `fail_on_revert = false`, a failed `assert*` *inside a handler action* reverts
-the handler call, and Foundry swallows it as "just another reverting call" — the
-suite would pass while the property is violated. So I5, I6, I8, I9 are checked
-inside the handler by **setting a ghost boolean** (never reverting) and asserted in
-the corresponding `invariant_*` function via `assertFalse(flag)`. I1/I4
-monotonicity use persisted previous-value trackers in the invariant contract.
+- Claim `decimals == asset.decimals()`, so `ONE = 10**decimals` and all arithmetic
+  is raw-unit.
+- Constructor rejects `asset.decimals() > 18`.
+- Floor division in `redeem`, `assets` computed pre-burn, price-neutral by
+  construction — so no slippage parameter and no MEV surface (invariant I1).
+- I1 monotonicity excludes the `supply == 0` terminal state (price is 0 there by
+  definition; supply can never recover).
+- Redeeming `amount == 0` reverts only in the dead state where `supply == 0`
+  (0/0); otherwise it is a harmless no-op. Left unguarded to avoid adding a branch.
+- Invariant violations that must fail the suite are recorded as ghost flags (I5, I6,
+  I8, I9), because under `fail_on_revert = false` an inline assertion revert in a
+  handler is swallowed. The handler is the escrow admin (it deploys the escrow) and
+  receives the full supply, distributing to actors by transfer.
 
-## Handler is the escrow admin
+## Things deliberately not present
 
-The admin surface (`distribute`, `correct`, `finalize`, `creditUncredited`,
-`sweepUncredited`) is `onlyAdmin`. For the handler to exercise it, the handler
-**deploys the escrow in its own constructor**, making `admin == handler`. The
-`Invariants` test reads `escrow`/`claim`/`asset` back off the handler.
-
-## Cross-run state accumulation
-
-Empirically (a throwaway probe, since removed) this Foundry version does **not**
-reset handler state between invariant runs — `afterInvariant` observes ghosts
-accumulated across the whole campaign. The coverage assertions
-(`ghost_finalizedAt > 0`, `ghost_reachedZeroSupply`, `>40% holder fully exited`,
-`preFinalizeRedeemAttempts > 0`) rely on this. If run under a Foundry that *does*
-reset between runs, these would instead reflect only the final run; they would
-still hold given the handler's biasing, but the guarantee weakens.
-
-## `RevenueSpigot.route` semantics
-
-The spec says "intercepts a fixed share". I implemented `route(source)` to pull
-only `amount * shareBps / 10000` from the source (via `transferFrom`, so the
-source must approve the spigot) and leave the remainder with the source, where
-`amount = min(source balance, source allowance)`. A zero computed share reverts
-(`NothingToRoute`) rather than emitting a no-op. `MIN_SHARE_BPS > 0` is enforced at
-construction so the intercept can never be zeroed.
-
-## Things I deliberately did **not** add
-
-No merkle distribution, redemption floor, coupon/accrual, par state, surplus
-sweep, lifecycle enum, pause, upgradeability, governance, multi-asset pool,
-maturity/conversion. No storage variable beyond §4 on the escrow. The claim token
-adds only `escrow` (immutable) and `mintingClosed` (the one-way latch, §5), which
-§5 specifies.
-
-## `mintingClosed` latch vs. per-mint escrow read
-
-Per §5, the claim token holds its own `mintingClosed` latch flipped once by
-`escrow.finalize() → claim.closeMinting()`, rather than reading `finalized` from
-the escrow on every mint. This keeps the batch-distribution hot path free of a
-cross-contract call.
+No merkle logic in this repo (distribution is external). No credited/uncredited
+split, no sweep, no fund/mint, no redemption floor, coupon/accrual, par state,
+lifecycle enum, pause, upgradeability, governance, multi-asset pool, or
+maturity/conversion.
