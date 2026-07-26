@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  FOUNDRY_PROFILE: default
+
+jobs:
+  test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        # lib/ is vendored (forge install --no-git), so no submodules needed.
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Format check
+        run: forge fmt --check
+
+      - name: Build (with sizes)
+        run: forge build --sizes
+
+      - name: Unit, fuzz & differential tests
+        run: forge test --no-match-path "test/invariant/*"
+
+      # The full spec invariant profiles (default 1000x200, ci 5000x500) are
+      # CI-grade long-running jobs. Run a substantial sample here so the job
+      # stays under the runner budget; bump the env vars (or FOUNDRY_PROFILE=ci)
+      # for the exhaustive nightly run.
+      - name: Invariant tests (sampled)
+        run: forge test --match-path "test/invariant/Invariants.t.sol"
+        env:
+          FOUNDRY_INVARIANT_RUNS: "256"
+          FOUNDRY_INVARIANT_DEPTH: "250"
+
+  coverage:
+    name: coverage summary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Coverage (src/ line >= 95%, branch >= 90%)
+        run: |
+          forge coverage --report summary --ir-minimum \
+            --no-match-coverage "(script|test)/" \
+            2>&1 | tee coverage.txt
+        env:
+          FOUNDRY_FUZZ_RUNS: "16"
+          FOUNDRY_INVARIANT_RUNS: "24"
+          FOUNDRY_INVARIANT_DEPTH: "150"
