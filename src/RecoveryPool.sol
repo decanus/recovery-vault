@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import { FixedPointMathLib } from "solady/utils/FixedPointMathLib.sol";
 import { ReentrancyGuard } from "solady/utils/ReentrancyGuard.sol";
 import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
 import { IERC20 } from "./interfaces/IERC20.sol";
@@ -61,10 +62,6 @@ contract RecoveryPool is ReentrancyGuard {
 
     /// @notice Principal actually raised, set once at `close()`.
     uint256 public principal;
-
-    /// @notice Hard ceiling on cumulative interest, derived from `principal` and
-    ///         `MAX_REPAYMENT_BPS` at `close()`. Accrual stops here.
-    uint256 public maxInterest;
 
     /// @notice Outstanding obligation as of `lastAccrual` — unpaid principal plus
     ///         interest accrued and not yet drawn down. Repayment reduces it 1:1.
@@ -168,12 +165,11 @@ contract RecoveryPool is ReentrancyGuard {
         closed = true;
         principal = raised;
         debt = raised;
-        maxInterest = raised * (MAX_REPAYMENT_BPS - BPS) / BPS;
         lastAccrual = uint64(block.timestamp);
         note.closeMinting();
 
         address(asset).safeTransfer(escrow, raised);
-        emit Closed(raised, maxInterest);
+        emit Closed(raised, maxInterest());
     }
 
     // ── Accrual ─────────────────────────────────────────────────────────────
@@ -184,23 +180,28 @@ contract RecoveryPool is ReentrancyGuard {
     ///         Because anyone may call this, the effective rate should be priced as
     ///         continuously compounded — that is its upper bound, and it is capped
     ///         in absolute terms by `maxInterest` regardless.
-    function accrue() public {
-        if (!closed) return;
+    /// @return owed The obligation after accrual, so callers that immediately need
+    ///         it do not have to re-derive it through `totalOwed()` — which would
+    ///         re-read storage the external calls in between have already
+    ///         invalidated for the optimiser.
+    function accrue() public returns (uint256 owed) {
+        if (!closed) return 0;
         uint256 dt = block.timestamp - lastAccrual;
-        if (dt == 0) return;
+        if (dt == 0) return debt;
         lastAccrual = uint64(block.timestamp);
 
         uint256 interest = _pendingInterest(dt);
-        if (interest == 0) return;
-        debt += interest;
+        if (interest == 0) return debt;
+        owed = debt + interest;
+        debt = owed;
         interestAccrued += interest;
-        emit Accrued(interest, debt);
+        emit Accrued(interest, owed);
     }
 
     /// @dev Interest for `dt` seconds on the current `debt`, clamped so cumulative
-    ///      interest never exceeds `maxInterest`.
+    ///      interest never exceeds `maxInterest()`.
     function _pendingInterest(uint256 dt) internal view returns (uint256 interest) {
-        uint256 headroom = maxInterest - interestAccrued;
+        uint256 headroom = maxInterest() - interestAccrued;
         if (headroom == 0) return 0;
         interest = debt * RATE_BPS * dt / (BPS * YEAR);
         if (interest > headroom) interest = headroom;
@@ -225,11 +226,11 @@ contract RecoveryPool is ReentrancyGuard {
         returns (uint256 assets, uint256 burned)
     {
         if (!closed) revert NotClosed();
-        accrue();
-        (assets, burned) = _previewRedeem(amount);
+        uint256 owed = accrue();
+        (assets, burned) = _previewRedeem(amount, owed);
         if (assets == 0) revert NothingToRedeem();
 
-        debt -= assets;
+        debt = owed - assets;
         note.burn(msg.sender, burned);
         address(asset).safeTransfer(to, assets);
         emit Redeemed(msg.sender, burned, assets);
@@ -238,25 +239,32 @@ contract RecoveryPool is ReentrancyGuard {
     /// @notice Preview `redeem(amount, …)` at the current block: the asset paid out
     ///         and the notes it costs. Includes interest pending since `lastAccrual`.
     function previewRedeem(uint256 amount) external view returns (uint256 assets, uint256 burned) {
-        return _previewRedeem(amount);
+        return _previewRedeem(amount, totalOwed());
     }
 
-    function _previewRedeem(uint256 amount) internal view returns (uint256 assets, uint256 burned) {
+    function _previewRedeem(uint256 amount, uint256 owed)
+        internal
+        view
+        returns (uint256 assets, uint256 burned)
+    {
         uint256 supply = note.totalSupply();
-        uint256 owed = totalOwed();
         if (supply == 0 || owed == 0) return (0, 0);
 
-        // Cash beyond the obligation is not LP money — it belongs to the escrow
-        // and is swept there by `forwardExcess`.
-        uint256 cash = asset.balanceOf(address(this));
-        if (cash > owed) cash = owed;
-
+        uint256 cash = _drawableCash(owed);
         assets = amount * cash / supply; // floor
-        burned = (assets * supply + owed - 1) / owed; // ceil
-        // Unreachable while `cash <= owed` (which the clamp above guarantees):
-        // burned <= ceil(amount * cash / owed) <= amount. Kept as a hard bound so
-        // no arithmetic path can burn more notes than were offered.
-        if (burned > amount) burned = amount;
+        // `burned <= ceil(amount * cash / owed) <= amount`, since `_drawableCash`
+        // caps `cash` at `owed`. Left unguarded: a clamp here could only ever mask
+        // a broken proof by silently burning too few notes, which would break
+        // obligation-neutrality — reverting on the burn is the safer failure.
+        burned = FixedPointMathLib.mulDivUp(assets, supply, owed); // ceil
+    }
+
+    /// @dev Repayment sitting in the pool that belongs to the LPs: the balance,
+    ///      capped at the outstanding obligation. Anything above the cap is the
+    ///      escrow's, and `forwardExcess` sweeps it there.
+    function _drawableCash(uint256 owed) internal view returns (uint256 cash) {
+        cash = asset.balanceOf(address(this));
+        if (cash > owed) cash = owed;
     }
 
     /// @notice Push any repayment beyond the outstanding obligation on to the
@@ -268,14 +276,13 @@ contract RecoveryPool is ReentrancyGuard {
     ///         keeps arriving after the LPs are square.
     function forwardExcess() external nonReentrant returns (uint256 excess) {
         if (!closed) revert NotClosed();
-        accrue();
+        uint256 owed = accrue();
 
         uint256 cash = asset.balanceOf(address(this));
         if (note.totalSupply() == 0) {
             debt = 0;
             excess = cash;
         } else {
-            uint256 owed = debt;
             excess = cash > owed ? cash - owed : 0;
         }
         if (excess == 0) revert NoExcess();
@@ -285,6 +292,14 @@ contract RecoveryPool is ReentrancyGuard {
     }
 
     // ── Views ───────────────────────────────────────────────────────────────
+
+    /// @notice Hard ceiling on cumulative interest — the whole premium the protocol
+    ///         can ever owe. Derived from `principal` and the immutable
+    ///         `MAX_REPAYMENT_BPS`, so it is fixed the moment `close()` runs and 0
+    ///         before it.
+    function maxInterest() public view returns (uint256) {
+        return principal * (MAX_REPAYMENT_BPS - BPS) / BPS;
+    }
 
     /// @notice The outstanding obligation at call time, including interest pending
     ///         since `lastAccrual`.
@@ -309,9 +324,6 @@ contract RecoveryPool is ReentrancyGuard {
     function cashPerNote() public view returns (uint256) {
         uint256 supply = note.totalSupply();
         if (supply == 0) return 0;
-        uint256 owed = totalOwed();
-        uint256 cash = asset.balanceOf(address(this));
-        if (cash > owed) cash = owed;
-        return cash * ONE / supply;
+        return _drawableCash(totalOwed()) * ONE / supply;
     }
 }

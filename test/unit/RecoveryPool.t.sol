@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import { Test } from "forge-std/Test.sol";
+import { BaseTest } from "./Base.t.sol";
 import { RecoveryPool } from "../../src/RecoveryPool.sol";
 import { RecoveryNote } from "../../src/RecoveryNote.sol";
 import { RecoveryEscrow } from "../../src/RecoveryEscrow.sol";
-import { RecoveryClaim } from "../../src/RecoveryClaim.sol";
 import { IERC20 } from "../../src/interfaces/IERC20.sol";
 import { MockERC20 } from "../mocks/MockERC20.sol";
 
@@ -13,26 +12,17 @@ import { MockERC20 } from "../mocks/MockERC20.sol";
 ///      repays the pool with interest by plain transfer. A real escrow is wired
 ///      in as the beneficiary so the end-to-end path (LP capital → claimants,
 ///      revenue → LPs, overflow → claimants) is exercised, not mocked.
-contract RecoveryPoolTest is Test {
-    MockERC20 internal asset;
-    RecoveryEscrow internal escrow;
-    RecoveryClaim internal claim;
+contract RecoveryPoolTest is BaseTest {
     RecoveryPool internal pool;
     RecoveryNote internal note;
-
-    address internal admin = address(this);
-    address internal alice = address(0xA11CE);
-    address internal bob = address(0xB0B);
-    address internal carol = address(0xCA201);
 
     uint256 internal constant LIABILITY = 100_000_000; // 100 units, 6dp
     uint256 internal constant RATE_BPS = 1000; // 10% / yr
     uint256 internal constant CAP_BPS = 12_000; // 1.2x principal, ever
 
-    function setUp() public virtual {
-        asset = new MockERC20("USD Coin", "USDC", 6);
-        escrow = new RecoveryEscrow(IERC20(address(asset)), LIABILITY, "Recovery Claim", "rcUSDC");
-        claim = escrow.claim();
+    function setUp() public override {
+        super.setUp();
+        _deploy(LIABILITY);
         pool = new RecoveryPool(
             IERC20(address(asset)), address(escrow), RATE_BPS, CAP_BPS, "Recovery Note", "rnUSDC"
         );

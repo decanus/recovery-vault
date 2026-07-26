@@ -128,7 +128,9 @@ consequences to state plainly rather than hide:
 
 `interestAccrued` is kept as storage even though the repo otherwise deleted its
 running totals as telemetry. It is not telemetry: it is what the cap is measured
-against. `principal` likewise anchors the cap.
+against. `principal` likewise anchors the cap — and because it does, `maxInterest()`
+is *derived* from it on read rather than stored, which is the same
+delete-the-derived-state instinct applied one level further.
 
 ### The credible-commitment gap
 
