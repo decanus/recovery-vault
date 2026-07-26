@@ -162,7 +162,6 @@ contract EscrowHandler is CommonBase, StdCheats, StdUtils {
         if (mode == 0) amt = 0;
         else if (mode == 1) amt = bal == 0 ? 0 : 1;
         else if (mode == 2) amt = bal; // full exit
-
         else amt = bound(amtSeed, 0, bal);
 
         if (!escrow.finalized()) {
