@@ -1,0 +1,14 @@
+# Foundry build artifacts
+cache/
+out/
+broadcast/
+
+# Coverage
+lcov.info
+coverage/
+
+# Env / secrets
+.env
+
+# OS
+.DS_Store
