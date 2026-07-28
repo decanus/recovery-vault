@@ -104,10 +104,22 @@ burn *ceils*, so the redeemer pays the dust and the obligation per note can only
 ever move up for the holders who stay. Flooring the burn would leak value out of
 the remaining notes.
 
-A consequence worth stating: drawing down is first-come on *available cash*. An
-LP who leaves cash in the pool may find a co-LP has drawn their fair share of it
-first. Nobody's total entitlement changes — only how much of it is already
-liquid — but it means the pool is a claim on a stream, not a bank account.
+A consequence worth stating, and it is sharper than it first looks: drawing down
+is first-come on *available cash*. Nobody's total **entitlement** changes — a
+draw burns notes in exact proportion to the cash it took, so the drawer converts
+claim into cash and the patient holder keeps their full claim. But **liquidity**
+is a race, and it is winner-take-most. `test_pool_partialRepaymentIsADrainRace`
+pins it: two LPs with identical 50M positions, a single 30M repayment that then
+stops. The LP who calls `redeem` in a loop takes **29.79M**; the one who calls it
+once takes **0.15M**. Both still hold claims worth their share of the remaining
+obligation, so no value was stolen — but the patient LP is holding a claim on an
+empty pool.
+
+This is benign here *only* because the pool's obligation is a debt with a cap that
+is expected to be repaid in full, and at full repayment the race provably washes
+out (`test_bothRulesAgreeAtFullRecovery`). It would **not** be benign for a pot
+that simply stops at partial recovery — which is exactly why this mechanism is not
+transplantable to the claim side. See `test/unit/ParBurn.t.sol`.
 
 ### Interest: touch-based accrual, hard cap
 
