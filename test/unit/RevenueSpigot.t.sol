@@ -74,6 +74,46 @@ contract RevenueSpigotTest is BaseTest {
         assertEq(asset.balanceOf(address(source)), 900_000, "remainder not left at source");
         // routed straight to the escrow; the spigot holds nothing
         assertEq(asset.balanceOf(address(spigot)), 0, "spigot should not custody funds");
+        assertEq(spigot.accountedBalance(address(source)), 900_000, "remainder not accounted");
+    }
+
+    function test_route_repeatedCallDoesNotReprocessRemainder() public {
+        spigot.register(address(source));
+        asset.mint(address(source), 1_000_000);
+        source.approveSpigot(address(spigot), type(uint256).max);
+
+        assertEq(spigot.route(address(source)), 100_000);
+
+        vm.expectRevert(RevenueSpigot.NothingToRoute.selector);
+        spigot.route(address(source));
+
+        assertEq(asset.balanceOf(address(escrow)), 100_000, "escrow should only get one share");
+        assertEq(asset.balanceOf(address(source)), 900_000, "source remainder moved");
+    }
+
+    function test_route_onlyInterceptsFreshRevenueAfterPriorRoute() public {
+        spigot.register(address(source));
+        asset.mint(address(source), 1_000_000);
+        source.approveSpigot(address(spigot), type(uint256).max);
+
+        spigot.route(address(source)); // accounts the 900k remainder
+        asset.mint(address(source), 400_000);
+
+        uint256 routed = spigot.route(address(source));
+
+        assertEq(routed, 40_000, "must only route 10% of the fresh 400k");
+        assertEq(asset.balanceOf(address(escrow)), 140_000);
+        assertEq(asset.balanceOf(address(source)), 1_260_000);
+        assertEq(spigot.accountedBalance(address(source)), 1_260_000);
+    }
+
+    function test_route_revertsIfShareNotApproved() public {
+        spigot.register(address(source));
+        asset.mint(address(source), 1_000_000);
+        source.approveSpigot(address(spigot), 99_999);
+
+        vm.expectRevert(RevenueSpigot.InsufficientAllowance.selector);
+        spigot.route(address(source));
     }
 
     function test_route_permissionless() public {
