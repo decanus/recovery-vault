@@ -35,6 +35,9 @@ contract RevenueSpigot {
     /// @notice Append-only set of authorised revenue sources.
     mapping(address => bool) public registered;
 
+    /// @notice Per-source balance already assessed by `route`.
+    mapping(address => uint256) public accountedBalance;
+
     // Pending timelocked share change.
     bool public changePending;
     uint256 public queuedShareBps;
@@ -53,6 +56,7 @@ contract RevenueSpigot {
     error TimelockNotElapsed();
     error NothingToRoute();
     error InvalidBounds();
+    error InsufficientAllowance();
 
     modifier onlyAdmin() {
         if (msg.sender != admin) revert OnlyAdmin();
@@ -93,21 +97,25 @@ contract RevenueSpigot {
         emit SourceRegistered(source);
     }
 
-    /// @notice Transfer the intercepted share of a registered source's approved
+    /// @notice Transfer the intercepted share of a registered source's fresh
     ///         balance to the escrow. Permissionless. The non-intercepted
-    ///         remainder is left with the source.
-    /// @dev    The source must have approved this spigot to pull. The amount
-    ///         considered is `min(source balance, source allowance to spigot)`.
+    ///         remainder is remembered so repeated calls cannot re-route it.
+    /// @dev    Fresh balance is `source balance - accountedBalance[source]`.
+    ///         The source must approve at least the intercepted share.
     function route(address source) external returns (uint256 toEscrow) {
         if (!registered[source]) revert NotRegistered();
         uint256 bal = asset.balanceOf(source);
-        uint256 allowed = asset.allowance(source, address(this));
-        uint256 amount = bal < allowed ? bal : allowed;
+        uint256 accounted = accountedBalance[source];
+        if (bal <= accounted) revert NothingToRoute();
+
+        uint256 amount = bal - accounted;
         toEscrow = amount * shareBps / BPS;
         if (toEscrow == 0) revert NothingToRoute();
+        if (asset.allowance(source, address(this)) < toEscrow) revert InsufficientAllowance();
         // Transfer straight to the escrow — any asset held by the escrow backs
         // the claims, so no intermediate hop or `fund` call is needed.
         address(asset).safeTransferFrom(source, escrow, toEscrow);
+        accountedBalance[source] = bal - toEscrow;
         emit Routed(source, toEscrow);
     }
 
